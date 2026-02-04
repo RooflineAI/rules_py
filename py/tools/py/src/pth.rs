@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     fs::{self, DirEntry, File},
     io::{BufRead, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
@@ -69,6 +70,12 @@ impl PthFile {
     // that the path file consists of pre-relativized paths. The new machinery
     // does that math on the Rust side rather than on the Bazel side, so the two
     // are `.pth` file incompatible.
+    //
+    // Top-level symlink strategy: instead of recursively symlinking every file
+    // from every site-packages directory, create one symlink per top-level
+    // package/module. Only when multiple site-packages dirs provide the same
+    // top-level name (namespace package conflict) do we fall back to recursive
+    // symlink-merging for that name.
     pub fn set_up_site_packages_dynamic(&self, opts: SitePackageOptions) -> miette::Result<()> {
         let dest = &opts.dest;
 
@@ -81,10 +88,21 @@ impl PthFile {
 
         let mut reader = BufReader::new(source_pth);
         let mut writer = BufWriter::new(dest_pth);
-
-        let mut line = String::new();
         let path_prefix = self.prefix.as_ref().map(|pre| Path::new(pre));
 
+        // Names to skip entirely (never symlink, never count as conflicts).
+        let skip_names: HashSet<&str> =
+            HashSet::from(["__pycache__", "__init__.py", "__pypackages__"]);
+
+        // Suffixes to exclude from conflict detection but still symlink.
+        let metadata_suffixes = [".dist-info", ".egg-info"];
+
+        // Phase 1: Read all entries; for site-packages dirs, collect top-level names
+        // and track which source dirs provide them.
+        let mut entries: Vec<(PathBuf, bool)> = Vec::new();
+        let mut toplevel_to_sources: HashMap<String, Vec<PathBuf>> = HashMap::new();
+
+        let mut line = String::new();
         while reader.read_line(&mut line).unwrap() > 0 {
             let entry = path_prefix
                 .map(|pre| pre.join(line.trim()))
@@ -92,23 +110,106 @@ impl PthFile {
 
             line.clear();
 
-            match entry.file_name() {
-                Some(name) if name == "site-packages" => {
-                    let src_dir = dest
-                        .join(entry.clone())
-                        .canonicalize()
-                        .into_diagnostic()
-                        .wrap_err(format!(
-                            "Unable to get full source dir path for {} relative to {}",
-                            entry.display(),
-                            dest.display(),
-                        ))?;
-                    create_symlinks(&src_dir, &src_dir, &dest, &opts.collision_strategy)?;
+            let is_site = entry.file_name().map_or(false, |n| n == "site-packages");
+            if is_site {
+                let resolved = dest
+                    .join(&entry)
+                    .canonicalize()
+                    .into_diagnostic()
+                    .wrap_err(format!(
+                        "Unable to resolve site-packages path {} relative to {}",
+                        entry.display(),
+                        dest.display(),
+                    ))?;
+
+                for child in fs::read_dir(&resolved).into_diagnostic().wrap_err(format!(
+                    "Unable to read site-packages directory {}",
+                    resolved.display()
+                ))? {
+                    let child = child.into_diagnostic()?;
+                    let name = child.file_name().to_string_lossy().to_string();
+                    if skip_names.contains(name.as_str())
+                        || metadata_suffixes.iter().any(|s| name.ends_with(s))
+                    {
+                        continue;
+                    }
+                    toplevel_to_sources
+                        .entry(name)
+                        .or_default()
+                        .push(resolved.clone());
                 }
-                _ => {
-                    writeln!(writer, "{}", entry.to_string_lossy())
-                        .into_diagnostic()
-                        .wrap_err("Unable to write new .pth file entry")?;
+            }
+            entries.push((entry, is_site));
+        }
+
+        // Phase 2: Identify conflicting names (provided by more than one source dir).
+        let conflicting_names: HashSet<String> = toplevel_to_sources
+            .iter()
+            .filter(|(_, sources)| sources.len() > 1)
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        // Phase 3: For each site-packages dir, create top-level symlinks for
+        // non-conflicting names and recursively merge conflicting ones.
+        // Non-site-packages entries are written as .pth lines (unchanged).
+        for (entry, is_site) in &entries {
+            if !is_site {
+                writeln!(writer, "{}", entry.to_string_lossy())
+                    .into_diagnostic()
+                    .wrap_err("Unable to write new .pth file entry")?;
+                continue;
+            }
+
+            let src_dir = dest
+                .join(entry)
+                .canonicalize()
+                .into_diagnostic()
+                .wrap_err(format!(
+                    "Unable to resolve site-packages path {}",
+                    entry.display(),
+                ))?;
+
+            for child in fs::read_dir(&src_dir).into_diagnostic()? {
+                let child = child.into_diagnostic()?;
+                let name = child.file_name().to_string_lossy().to_string();
+
+                // Skip caches and Bazel-inserted __init__.py.
+                if skip_names.contains(name.as_str()) {
+                    continue;
+                }
+
+                let child_path = child.path();
+
+                if conflicting_names.contains(&name) {
+                    // Namespace conflict: recursively symlink-merge so all
+                    // providers contribute their files under this name.
+                    if child_path.is_dir() {
+                        create_symlinks(
+                            &child_path,
+                            &src_dir,
+                            dest,
+                            &opts.collision_strategy,
+                        )?;
+                    } else {
+                        create_symlink(
+                            &child,
+                            &src_dir,
+                            dest,
+                            &opts.collision_strategy,
+                        )?;
+                    }
+                } else {
+                    // No conflict: single top-level symlink.
+                    let link = dest.join(&name);
+                    if !link.exists() {
+                        std::os::unix::fs::symlink(&child_path, &link)
+                            .into_diagnostic()
+                            .wrap_err(format!(
+                                "Unable to create top-level symlink: {} -> {}",
+                                link.display(),
+                                child_path.display(),
+                            ))?;
+                    }
                 }
             }
         }
