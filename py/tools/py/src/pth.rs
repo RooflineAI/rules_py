@@ -71,11 +71,15 @@ impl PthFile {
     // does that math on the Rust side rather than on the Bazel side, so the two
     // are `.pth` file incompatible.
     //
-    // Top-level symlink strategy: instead of recursively symlinking every file
-    // from every site-packages directory, create one symlink per top-level
-    // package/module. Only when multiple site-packages dirs provide the same
-    // top-level name (namespace package conflict) do we fall back to recursive
-    // symlink-merging for that name.
+    // .pth-to-external strategy: instead of creating symlinks (even top-level
+    // ones), write .pth entries pointing directly to the canonicalized
+    // external/ paths where real files live. This bypasses both symlink layers
+    // (venv→runfiles and runfiles→external), eliminating all readlink()
+    // overhead during Python imports.
+    //
+    // For namespace conflicts (e.g. nvidia-* packages on Linux that all
+    // provide `nvidia/`), fall back to recursive symlink-merging so all
+    // providers contribute their files under the shared name.
     pub fn set_up_site_packages_dynamic(&self, opts: SitePackageOptions) -> miette::Result<()> {
         let dest = &opts.dest;
 
@@ -94,12 +98,13 @@ impl PthFile {
         let skip_names: HashSet<&str> =
             HashSet::from(["__pycache__", "__init__.py", "__pypackages__"]);
 
-        // Suffixes to exclude from conflict detection but still symlink.
+        // Suffixes to exclude from conflict detection but still include via .pth.
         let metadata_suffixes = [".dist-info", ".egg-info"];
 
-        // Phase 1: Read all entries; for site-packages dirs, collect top-level names
-        // and track which source dirs provide them.
-        let mut entries: Vec<(PathBuf, bool)> = Vec::new();
+        // Phase 1: Read all entries; for site-packages dirs, resolve to
+        // external/ via file-symlink probing and collect top-level names.
+        let mut site_external_dirs: Vec<PathBuf> = Vec::new();
+        let mut non_site_entries: Vec<PathBuf> = Vec::new();
         let mut toplevel_to_sources: HashMap<String, Vec<PathBuf>> = HashMap::new();
 
         let mut line = String::new();
@@ -112,7 +117,7 @@ impl PthFile {
 
             let is_site = entry.file_name().map_or(false, |n| n == "site-packages");
             if is_site {
-                let resolved = dest
+                let runfiles_dir = dest
                     .join(&entry)
                     .canonicalize()
                     .into_diagnostic()
@@ -122,9 +127,15 @@ impl PthFile {
                         dest.display(),
                     ))?;
 
-                for child in fs::read_dir(&resolved).into_diagnostic().wrap_err(format!(
+                // Resolve to external/ by probing a file symlink inside.
+                // Falls back to runfiles path if no symlinks found (e.g. all
+                // files are generated, or directory is already external/).
+                let external_dir = resolve_to_external(&runfiles_dir)
+                    .unwrap_or_else(|| runfiles_dir.clone());
+
+                for child in fs::read_dir(&runfiles_dir).into_diagnostic().wrap_err(format!(
                     "Unable to read site-packages directory {}",
-                    resolved.display()
+                    runfiles_dir.display()
                 ))? {
                     let child = child.into_diagnostic()?;
                     let name = child.file_name().to_string_lossy().to_string();
@@ -136,10 +147,12 @@ impl PthFile {
                     toplevel_to_sources
                         .entry(name)
                         .or_default()
-                        .push(resolved.clone());
+                        .push(runfiles_dir.clone());
                 }
+                site_external_dirs.push(external_dir);
+            } else {
+                non_site_entries.push(entry);
             }
-            entries.push((entry, is_site));
         }
 
         // Phase 2: Identify conflicting names (provided by more than one source dir).
@@ -149,72 +162,159 @@ impl PthFile {
             .map(|(name, _)| name.clone())
             .collect();
 
-        // Phase 3: For each site-packages dir, create top-level symlinks for
-        // non-conflicting names and recursively merge conflicting ones.
-        // Non-site-packages entries are written as .pth lines (unchanged).
-        for (entry, is_site) in &entries {
-            if !is_site {
-                writeln!(writer, "{}", entry.to_string_lossy())
-                    .into_diagnostic()
-                    .wrap_err("Unable to write new .pth file entry")?;
-                continue;
-            }
-
-            let src_dir = dest
-                .join(entry)
-                .canonicalize()
+        // Phase 3: Write .pth entries and handle conflicts.
+        //
+        // Non-site-packages entries (first-party code): .pth lines unchanged.
+        for entry in &non_site_entries {
+            writeln!(writer, "{}", entry.to_string_lossy())
                 .into_diagnostic()
-                .wrap_err(format!(
-                    "Unable to resolve site-packages path {}",
-                    entry.display(),
-                ))?;
+                .wrap_err("Unable to write new .pth file entry")?;
+        }
 
-            for child in fs::read_dir(&src_dir).into_diagnostic()? {
-                let child = child.into_diagnostic()?;
-                let name = child.file_name().to_string_lossy().to_string();
+        // Site-packages entries: write a .pth line pointing directly to the
+        // external/ path where real files live. Python adds this to sys.path,
+        // so all packages are importable with zero symlink traversal.
+        //
+        // For conflicting names (e.g. nvidia-* on Linux), additionally
+        // symlink-merge into the venv's site-packages via the runfiles dir.
+        // Site-packages is earlier on sys.path than .pth additions, so the
+        // symlinked version takes precedence for conflicting names.
+        for external_dir in &site_external_dirs {
+            writeln!(writer, "{}", external_dir.to_string_lossy())
+                .into_diagnostic()
+                .wrap_err("Unable to write .pth entry for site-packages")?;
+        }
 
-                // Skip caches and Bazel-inserted __init__.py.
-                if skip_names.contains(name.as_str()) {
-                    continue;
-                }
+        // Handle namespace conflicts (e.g. nvidia-* packages on Linux all
+        // providing nvidia/). Instead of scanning every site-packages dir and
+        // creating per-file recursive symlinks, we use targeted directory-level
+        // merging:
+        //
+        // 1. Only look at directories that actually contribute each conflict
+        //    (from toplevel_to_sources), skipping the ~176 that don't.
+        // 2. Collect children across all contributing directories.
+        // 3. Create directory-level symlinks for unique children (e.g.
+        //    nvidia/cublas/ comes only from nvidia-cublas-cu12).
+        // 4. Recurse into sub-directories that themselves conflict across
+        //    sources, handling arbitrary nesting depth.
+        // 5. Resolve all symlink targets to their canonical external/ paths
+        //    so the venv never chains through runfiles symlinks.
+        //
+        // For 15 nvidia-* packages this creates ~15 directory symlinks
+        // instead of ~300 file-level symlinks, and avoids scanning ~176
+        // unrelated site-packages directories entirely.
+        if !conflicting_names.is_empty() {
+            for name in &conflicting_names {
+                let source_dirs: Vec<PathBuf> = toplevel_to_sources[name]
+                    .iter()
+                    .map(|sp| sp.join(name))
+                    .collect();
 
-                let child_path = child.path();
-
-                if conflicting_names.contains(&name) {
-                    // Namespace conflict: recursively symlink-merge so all
-                    // providers contribute their files under this name.
-                    if child_path.is_dir() {
-                        create_symlinks(
-                            &child_path,
-                            &src_dir,
-                            dest,
-                            &opts.collision_strategy,
-                        )?;
-                    } else {
-                        create_symlink(
-                            &child,
-                            &src_dir,
-                            dest,
-                            &opts.collision_strategy,
-                        )?;
-                    }
-                } else {
-                    // No conflict: single top-level symlink.
-                    let link = dest.join(&name);
-                    if !link.exists() {
-                        std::os::unix::fs::symlink(&child_path, &link)
-                            .into_diagnostic()
-                            .wrap_err(format!(
-                                "Unable to create top-level symlink: {} -> {}",
-                                link.display(),
-                                child_path.display(),
-                            ))?;
-                    }
-                }
+                merge_namespace_conflict(
+                    &source_dirs,
+                    &dest.join(name),
+                    &opts.collision_strategy,
+                )?;
             }
         }
 
         Ok(())
+    }
+}
+
+/// Merge multiple source directories that share a namespace (e.g. nvidia/ from
+/// 15 nvidia-* packages) into a single destination directory using directory-level
+/// symlinks. Only recurses into sub-directories that themselves have conflicts
+/// across sources, handling arbitrary nesting depth.
+///
+/// All symlink targets are resolved to their canonical paths (typically in
+/// Bazel's external/ directory) to avoid chaining through runfiles symlinks.
+fn merge_namespace_conflict(
+    sources: &[PathBuf],
+    dest_dir: &Path,
+    collision_strategy: &CollisionResolutionStrategy,
+) -> miette::Result<()> {
+    fs::create_dir_all(dest_dir)
+        .into_diagnostic()
+        .wrap_err(format!(
+            "Unable to create merge directory: {}",
+            dest_dir.to_string_lossy()
+        ))?;
+
+    // Collect all children from all source directories.
+    // child_name -> list of full paths to that child across sources.
+    let mut children: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    for source in sources {
+        if !source.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(source).into_diagnostic().wrap_err(format!(
+            "Unable to read conflict source directory {}",
+            source.to_string_lossy()
+        ))? {
+            let entry = entry.into_diagnostic()?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "__pycache__" {
+                continue;
+            }
+            children.entry(name).or_default().push(entry.path());
+        }
+    }
+
+    for (name, paths) in &children {
+        let dest_child = dest_dir.join(name);
+        if dest_child.exists() || dest_child.is_symlink() {
+            continue;
+        }
+
+        if paths.len() == 1 {
+            // Only one source provides this child — single symlink,
+            // resolved to canonical path to skip runfiles indirection.
+            let target = resolve_symlink_target(&paths[0]);
+            std::os::unix::fs::symlink(&target, &dest_child)
+                .into_diagnostic()
+                .wrap_err(format!(
+                    "Unable to create symlink: {} -> {}",
+                    dest_child.to_string_lossy(),
+                    target.to_string_lossy()
+                ))?;
+        } else if paths[0].is_dir() {
+            // Multiple sources provide this directory — recurse to merge.
+            merge_namespace_conflict(paths, &dest_child, collision_strategy)?;
+        } else {
+            // Multiple sources provide the same file (e.g. namespace __init__.py).
+            // These are typically identical markers. Symlink to the first,
+            // resolved to canonical path.
+            let target = resolve_symlink_target(&paths[0]);
+            std::os::unix::fs::symlink(&target, &dest_child)
+                .into_diagnostic()
+                .wrap_err(format!(
+                    "Unable to create symlink for shared file: {} -> {}",
+                    dest_child.to_string_lossy(),
+                    target.to_string_lossy()
+                ))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolve a path to its canonical target to avoid symlink chains.
+///
+/// For files and directory symlinks: canonicalize() follows all symlinks.
+/// For real directories (Bazel runfiles — real dirs with per-file symlinks
+/// inside): probe inside to find the external/ equivalent via
+/// resolve_to_external().
+fn resolve_symlink_target(path: &Path) -> PathBuf {
+    if path.is_dir() && !path.is_symlink() {
+        // Real directory in runfiles — files inside are symlinks to external/.
+        resolve_to_external(path).unwrap_or_else(|| {
+            path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+        })
+    } else {
+        // File or directory symlink — canonicalize directly.
+        path.canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
     }
 }
 
@@ -366,6 +466,50 @@ fn create_symlink(
         ))?;
 
     Ok(())
+}
+
+/// Resolve a runfiles site-packages directory to its external/ equivalent
+/// by following per-file symlinks to find where the real files live.
+///
+/// Bazel's runfiles tree has real directories containing per-file symlinks:
+///   runfiles/.../site-packages/pkg/  (real dir)
+///     __init__.py  (symlink → external/.../site-packages/pkg/__init__.py)
+///
+/// canonicalize() on the directory returns the runfiles path (it's real).
+/// We need to probe a file inside, canonicalize it, and strip the suffix
+/// to recover the external/ site-packages path.
+fn resolve_to_external(site_packages_dir: &Path) -> Option<PathBuf> {
+    fn find_file_symlink(dir: &Path, depth: u32) -> Option<(PathBuf, PathBuf)> {
+        if depth > 3 {
+            return None;
+        }
+        for entry in fs::read_dir(dir).ok()? {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.is_symlink() && !path.is_dir() {
+                let canonical = path.canonicalize().ok()?;
+                return Some((path, canonical));
+            }
+            if path.is_dir() && !path.is_symlink() {
+                if let Some(found) = find_file_symlink(&path, depth + 1) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    let (file_in_runfiles, canonical) = find_file_symlink(site_packages_dir, 0)?;
+    // file_in_runfiles = .../site-packages/cloudpathlib/__init__.py
+    // canonical        = .../external/.../site-packages/cloudpathlib/__init__.py
+    // relative         = cloudpathlib/__init__.py
+    let relative = file_in_runfiles.strip_prefix(site_packages_dir).ok()?;
+    let depth = relative.components().count();
+    let mut external_base = canonical.as_path();
+    for _ in 0..depth {
+        external_base = external_base.parent()?;
+    }
+    Some(external_base.to_path_buf())
 }
 
 fn is_same_file(p1: &Path, p2: &Path) -> miette::Result<bool> {
