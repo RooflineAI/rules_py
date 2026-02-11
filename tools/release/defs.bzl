@@ -17,6 +17,8 @@ def _map_os_to_triple(os):
 # buildozer: disable=function-docstring
 def rust_binary(name, visibility = [], **kwargs):
     selection = {}
+    # Fallback for cross-builds to unsupported target platforms.
+    selection.update([["//tools/platforms:linux_riscv64", "{}_linux_x86_64_build".format(name)]])
     for os in DEFAULT_OS:
         outs = []
 
