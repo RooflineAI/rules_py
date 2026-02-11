@@ -486,7 +486,10 @@ fn resolve_to_external(site_packages_dir: &Path) -> Option<PathBuf> {
         for entry in fs::read_dir(dir).ok()? {
             let entry = entry.ok()?;
             let path = entry.path();
-            if path.is_symlink() && !path.is_dir() {
+            if path.is_symlink()
+                && !path.is_dir()
+                && path.file_name().map_or(true, |n| n != "__init__.py")
+            {
                 let canonical = path.canonicalize().ok()?;
                 return Some((path, canonical));
             }
